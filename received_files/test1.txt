@@ -1,0 +1,4 @@
+Hello Akshatha!
+
+This is a test file for the LAN Chat Application.
+File sharing is working.
