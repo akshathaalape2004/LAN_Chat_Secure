@@ -4,6 +4,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime
 import threading
 import os
+import socket
 
 from network import LANChat
 from file_transfer import receive_file, send_file as transfer_file
@@ -49,8 +50,26 @@ class LANChatApp:
 
         self.build_ui()
 
+        # Reserve a unique TCP file-transfer port before announcing this peer.
+        self.file_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.file_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.file_server.bind(("127.0.0.1", 0))
+        self.file_server.listen(5)
+        self.file_port = self.file_server.getsockname()[1]
+        threading.Thread(
+            target=receive_file,
+            args=(self.file_port,),
+            kwargs={
+                "on_file_request": self.request_file_approval,
+                "on_file_received": self.file_received_notification,
+                "server_socket": self.file_server,
+            },
+            daemon=True,
+        ).start()
+
         self.network = LANChat(
             self.username,
+            file_port=self.file_port,
             on_message=self.receive_message,
             on_user=self.user_discovered
         )
@@ -492,13 +511,15 @@ class LANChatApp:
         if not file_path:
             return
 
-        # Preserve the existing username-based port arrangement.
-        if self.selected_user.lower() == "rahul":
-            receiver_port = 5003
-        elif self.selected_user.lower() == "akshatha":
-            receiver_port = 5002
-        else:
-            receiver_port = 5004
+        peer = self.network.peers.get(self.selected_user, {})
+        receiver_port = peer.get("file_port")
+        if not receiver_port:
+            messagebox.showerror(
+                "Peer unavailable",
+                "The selected user's file-transfer port has not been discovered yet.",
+                parent=self.root,
+            )
+            return
 
         receiver_ip = self.users.get(self.selected_user)
 
@@ -629,25 +650,5 @@ class LANChatApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = LANChatApp(root)
-
-    # Preserve the existing receiver-port arrangement.
-    if app.username.lower() == "akshatha":
-        file_port = 5002
-    elif app.username.lower() == "rahul":
-        file_port = 5003
-    else:
-        file_port = 5004
-
-    app.file_port = file_port
-
-    threading.Thread(
-        target=receive_file,
-        args=(file_port,),
-        kwargs={
-            "on_file_request": app.request_file_approval,
-            "on_file_received": app.file_received_notification
-        },
-        daemon=True
-    ).start()
 
     root.mainloop()

@@ -77,7 +77,7 @@ def build_aad(sender_username, filename, file_size, sha256_hash, chunk_number):
     ).encode("utf-8")
 
 
-def receive_file(port, on_file_request=None, on_file_received=None):
+def receive_file(port, on_file_request=None, on_file_received=None, server_socket=None):
     """
     Listen for encrypted file transfers.
 
@@ -85,10 +85,13 @@ def receive_file(port, on_file_request=None, on_file_received=None):
     to accept a file, or False to reject it.
     """
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", port))
-    server.listen(5)
+    if server_socket is None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", port))
+        server.listen(5)
+    else:
+        server = server_socket
 
     print(f"Secure file receiver listening on port {port}")
 

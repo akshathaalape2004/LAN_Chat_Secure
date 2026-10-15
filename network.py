@@ -17,9 +17,10 @@ DISCOVERY_PORTS = range(5001, 5011)
 
 class LANChat:
 
-    def __init__(self, username, on_message=None, on_user=None):
+    def __init__(self, username, on_message=None, on_user=None, file_port=None):
 
         self.username = username
+        self.file_port = file_port
         self.on_message = on_message
         self.on_user = on_user
 
@@ -375,6 +376,7 @@ class LANChat:
                     peer_port = packet.get(
                         "port"
                     )
+                    peer_file_port = packet.get("file_port")
 
                     # X25519 public key
                     peer_x25519_public_key = (
@@ -471,7 +473,8 @@ class LANChat:
                             username
                         ] = {
                             "ip": address[0],
-                            "port": peer_port
+                            "port": peer_port,
+                            "file_port": peer_file_port
                         }
 
                     print(
@@ -529,6 +532,7 @@ class LANChat:
                         conn,
                         {
                             "type": "hello_ack",
+                            "file_port": self.file_port,
 
                             "username":
                                 self.username,
@@ -820,6 +824,7 @@ class LANChat:
                 sock,
                 {
                     "type": "hello",
+                    "file_port": self.file_port,
 
                     "username":
                         self.username,
@@ -961,6 +966,10 @@ class LANChat:
             session.generate_session_key(
                 peer_x25519_public_key
             )
+            # Refresh the peer's advertised file-transfer port.
+            peer_file_port = response.get("file_port")
+            if isinstance(peer_file_port, int) and 1 <= peer_file_port <= 65535:
+                self.peers[username]["file_port"] = peer_file_port
 
             self.sessions[
                 username
@@ -1082,6 +1091,7 @@ class LANChat:
                 port = packet.get(
                     "port"
                 )
+                file_port = packet.get("file_port")
 
                 if not port:
                     continue
@@ -1092,7 +1102,8 @@ class LANChat:
 
                 new_peer = {
                     "ip": ip,
-                    "port": port
+                    "port": port,
+                    "file_port": file_port
                 }
 
                 self.peers[
@@ -1136,7 +1147,8 @@ class LANChat:
             {
                 "type": "discover",
                 "username": self.username,
-                "port": self.chat_port
+                "port": self.chat_port,
+                "file_port": self.file_port
             }
         ).encode("utf-8")
 
