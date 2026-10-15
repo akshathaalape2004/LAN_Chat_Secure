@@ -1,3 +1,4 @@
+
 import socket
 import os
 import hashlib
@@ -12,755 +13,341 @@ GCM_TAG_SIZE = 16
 
 MAX_USERNAME_LENGTH = 256
 MAX_FILENAME_LENGTH = 1024
+MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB
+CONNECT_TIMEOUT = 10
+TRANSFER_TIMEOUT = 120
+APPROVAL_TIMEOUT = 120
 
-
-# Stores the existing X25519/HKDF session keys.
-# Key = peer username
 _SESSION_KEYS = {}
 _SESSION_LOCK = threading.Lock()
 
 
 def register_session(username, session_key):
-    """
-    Register an already-established secure chat session
-    for use by file transfer.
-    """
-
     if not username:
         raise ValueError("Username is required")
-
-    if not isinstance(session_key, bytes):
-        raise TypeError("Session key must be bytes")
-
-    if len(session_key) != 32:
+    if not isinstance(session_key, bytes) or len(session_key) != 32:
         raise ValueError("Session key must be 32 bytes")
 
     with _SESSION_LOCK:
         _SESSION_KEYS[username] = session_key
 
-    print(
-        f"Secure file-transfer session registered for {username}"
-    )
+    print(f"Secure file-transfer session registered for {username}")
 
 
 def unregister_session(username):
-    """
-    Remove a session when the chat connection closes.
-    """
-
     with _SESSION_LOCK:
         _SESSION_KEYS.pop(username, None)
 
 
 def get_session_key(username):
-    """
-    Get the existing secure session key for a peer.
-    """
-
     with _SESSION_LOCK:
         return _SESSION_KEYS.get(username)
 
 
 def recv_exact(sock, length):
-    """
-    Receive exactly 'length' bytes.
-    """
-
-    data = b""
-
+    data = bytearray()
     while len(data) < length:
-
-        chunk = sock.recv(
-            length - len(data)
-        )
-
+        chunk = sock.recv(length - len(data))
         if not chunk:
-            raise ConnectionError(
-                "Connection closed while receiving data"
-            )
-
-        data += chunk
-
-    return data
+            raise ConnectionError("Connection closed during transfer")
+        data.extend(chunk)
+    return bytes(data)
 
 
 def send_uint32(sock, value):
-    sock.sendall(
-        value.to_bytes(
-            4,
-            byteorder="big"
-        )
-    )
+    sock.sendall(value.to_bytes(4, "big"))
 
 
 def recv_uint32(sock):
-    return int.from_bytes(
-        recv_exact(sock, 4),
-        byteorder="big"
-    )
+    return int.from_bytes(recv_exact(sock, 4), "big")
 
 
 def send_uint64(sock, value):
-    sock.sendall(
-        value.to_bytes(
-            8,
-            byteorder="big"
-        )
-    )
+    sock.sendall(value.to_bytes(8, "big"))
 
 
 def recv_uint64(sock):
-    return int.from_bytes(
-        recv_exact(sock, 8),
-        byteorder="big"
-    )
+    return int.from_bytes(recv_exact(sock, 8), "big")
 
 
-def build_aad(
-    sender_username,
-    filename,
-    file_size,
-    sha256_hash,
-    chunk_number
-):
-    """
-    Additional authenticated data for AES-GCM.
-
-    This protects the file-transfer metadata and
-    chunk ordering from tampering.
-    """
-
+def build_aad(sender_username, filename, file_size, sha256_hash, chunk_number):
     return (
-        f"{sender_username}|"
-        f"{filename}|"
-        f"{file_size}|"
-        f"{sha256_hash}|"
-        f"{chunk_number}"
+        f"{sender_username}|{filename}|{file_size}|"
+        f"{sha256_hash}|{chunk_number}"
     ).encode("utf-8")
 
 
-def receive_file(port):
+def receive_file(port, on_file_request=None, on_file_received=None):
     """
-    Secure file receiver.
+    Listen for encrypted file transfers.
 
-    File contents are encrypted using the existing
-    X25519 + HKDF session key and AES-GCM.
+    on_file_request(sender, filename, size) must return True
+    to accept a file, or False to reject it.
     """
 
-    server = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM
-    )
-
-    server.setsockopt(
-        socket.SOL_SOCKET,
-        socket.SO_REUSEADDR,
-        1
-    )
-
-    server.bind(
-        ("127.0.0.1", port)
-    )
-
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
     server.listen(5)
 
-    print(
-        f"Secure file receiver listening on port {port}"
-    )
+    print(f"Secure file receiver listening on port {port}")
 
     while True:
-
         conn = None
+        temp_filepath = None
 
         try:
-
             conn, address = server.accept()
+            conn.settimeout(TRANSFER_TIMEOUT)
+            print(f"File connection received from {address}")
 
-            print(
-                f"File connection received from {address}"
-            )
+            if recv_exact(conn, 5) != b"LCSF1":
+                raise ValueError("Invalid file-transfer protocol")
 
-            # Protocol identifier
-            magic = recv_exact(
-                conn,
-                5
-            )
+            username_length = recv_uint32(conn)
+            if not 1 <= username_length <= MAX_USERNAME_LENGTH:
+                raise ValueError("Invalid sender username length")
 
-            if magic != b"LCSF1":
+            sender = recv_exact(conn, username_length).decode("utf-8")
 
-                print(
-                    "Invalid file-transfer protocol."
-                )
+            filename_length = recv_uint32(conn)
+            if not 1 <= filename_length <= MAX_FILENAME_LENGTH:
+                raise ValueError("Invalid filename length")
 
-                conn.close()
-                continue
+            supplied_filename = recv_exact(conn, filename_length).decode("utf-8")
+            filename = os.path.basename(supplied_filename)
 
-            # -----------------------------
-            # Receive sender username
-            # -----------------------------
+            if not filename or filename in (".", ".."):
+                raise ValueError("Invalid filename")
 
-            username_length = recv_uint32(
-                conn
-            )
+            file_size = recv_uint64(conn)
+            if file_size > MAX_FILE_SIZE:
+                conn.sendall(b"R")
+                raise ValueError("File exceeds the 1 GB size limit")
 
+            expected_hash = recv_exact(conn, 64).decode("ascii")
             if (
-                username_length == 0
-                or username_length > MAX_USERNAME_LENGTH
+                len(expected_hash) != 64
+                or any(c not in "0123456789abcdefABCDEF" for c in expected_hash)
             ):
+                conn.sendall(b"R")
+                raise ValueError("Invalid SHA-256 metadata")
 
-                raise ValueError(
-                    "Invalid username length"
-                )
-
-            username_data = recv_exact(
-                conn,
-                username_length
-            )
-
-            sender_username = username_data.decode(
-                "utf-8"
-            )
-
-            # -----------------------------
-            # Receive filename
-            # -----------------------------
-
-            filename_length = recv_uint32(
-                conn
-            )
-
-            if (
-                filename_length == 0
-                or filename_length > MAX_FILENAME_LENGTH
-            ):
-
-                raise ValueError(
-                    "Invalid filename length"
-                )
-
-            filename_data = recv_exact(
-                conn,
-                filename_length
-            )
-
-            original_filename = filename_data.decode(
-                "utf-8"
-            )
-
-            # Prevent path traversal
-            filename = os.path.basename(
-                original_filename
-            )
-
-            if not filename:
-                raise ValueError(
-                    "Invalid filename"
-                )
-
-            # -----------------------------
-            # Receive file size
-            # -----------------------------
-
-            file_size = recv_uint64(
-                conn
-            )
-
-            # -----------------------------
-            # Receive expected SHA-256
-            # -----------------------------
-
-            expected_hash = recv_exact(
-                conn,
-                64
-            ).decode("ascii")
-
-            # -----------------------------
-            # Find existing secure session
-            # -----------------------------
-
-            session_key = get_session_key(
-                sender_username
-            )
-
+            session_key = get_session_key(sender)
             if session_key is None:
-
-                print(
-                    f"No secure session exists for "
-                    f"{sender_username}"
+                conn.sendall(b"R")
+                raise ConnectionError(
+                    f"No secure session key is available for {sender}"
                 )
 
-                conn.close()
+            # Ask the GUI to obtain the recipient's decision.
+            if on_file_request is None:
+                accepted = True
+            else:
+                accepted = bool(on_file_request(sender, filename, file_size))
+
+            conn.sendall(b"A" if accepted else b"R")
+
+            if not accepted:
+                print(f"File rejected by recipient: {filename}")
                 continue
 
-            aes = AESGCM(
-                session_key
-            )
+            aes = AESGCM(session_key)
+            os.makedirs("received_files", exist_ok=True)
 
-            os.makedirs(
-                "received_files",
-                exist_ok=True
-            )
+            filepath = os.path.join("received_files", filename)
+            base, extension = os.path.splitext(filename)
+            counter = 1
 
-            filepath = os.path.join(
-                "received_files",
-                filename
-            )
-
-            # Prevent accidental overwrite
-            if os.path.exists(filepath):
-
-                base, extension = os.path.splitext(
-                    filename
+            while os.path.exists(filepath):
+                filepath = os.path.join(
+                    "received_files", f"{base}_{counter}{extension}"
                 )
-
-                counter = 1
-
-                while os.path.exists(filepath):
-
-                    filepath = os.path.join(
-                        "received_files",
-                        f"{base}_{counter}{extension}"
-                    )
-
-                    counter += 1
+                counter += 1
 
             temp_filepath = filepath + ".part"
-
             hasher = hashlib.sha256()
-
             received_size = 0
             chunk_number = 0
 
-            print(
-                f"Receiving encrypted file: {filename}"
-            )
-
-            with open(
-                temp_filepath,
-                "wb"
-            ) as file:
-
+            with open(temp_filepath, "wb") as output:
                 while received_size < file_size:
+                    encrypted_length = recv_uint32(conn)
 
-                    encrypted_length = recv_uint32(
-                        conn
-                    )
+                    if not GCM_TAG_SIZE <= encrypted_length <= BUFFER_SIZE + GCM_TAG_SIZE:
+                        raise ValueError("Invalid encrypted chunk length")
 
-                    if encrypted_length < GCM_TAG_SIZE:
-
-                        raise ValueError(
-                            "Invalid encrypted chunk size"
-                        )
-
-                    if encrypted_length > (
-                        BUFFER_SIZE + GCM_TAG_SIZE
-                    ):
-
-                        raise ValueError(
-                            "Encrypted chunk is too large"
-                        )
-
-                    nonce = recv_exact(
-                        conn,
-                        NONCE_SIZE
-                    )
-
-                    encrypted_data = recv_exact(
-                        conn,
-                        encrypted_length
-                    )
+                    nonce = recv_exact(conn, NONCE_SIZE)
+                    encrypted_data = recv_exact(conn, encrypted_length)
 
                     aad = build_aad(
-                        sender_username,
-                        filename,
-                        file_size,
-                        expected_hash,
-                        chunk_number
+                        sender, filename, file_size, expected_hash, chunk_number
                     )
+                    plaintext = aes.decrypt(nonce, encrypted_data, aad)
 
-                    plaintext = aes.decrypt(
-                        nonce,
-                        encrypted_data,
-                        aad
-                    )
+                    if not plaintext:
+                        raise ValueError("Unexpected empty file chunk")
 
-                    remaining = (
-                        file_size - received_size
-                    )
+                    if received_size + len(plaintext) > file_size:
+                        raise ValueError("Received more data than expected")
 
-                    if len(plaintext) > remaining:
-
-                        raise ValueError(
-                            "Received more data than expected"
-                        )
-
-                    file.write(
-                        plaintext
-                    )
-
-                    hasher.update(
-                        plaintext
-                    )
-
-                    received_size += len(
-                        plaintext
-                    )
-
+                    output.write(plaintext)
+                    hasher.update(plaintext)
+                    received_size += len(plaintext)
                     chunk_number += 1
-
-            # -----------------------------
-            # Verify SHA-256
-            # -----------------------------
 
             actual_hash = hasher.hexdigest()
 
-            print(
-                f"Expected SHA-256: {expected_hash}"
-            )
+            if received_size != file_size or actual_hash != expected_hash:
+                raise ValueError("File size or SHA-256 verification failed")
 
-            print(
-                f"Actual SHA-256:   {actual_hash}"
-            )
+            os.replace(temp_filepath, filepath)
+            temp_filepath = None
 
-            if actual_hash != expected_hash:
+            # Tell the sender the receiver verified and saved the file.
+            conn.sendall(b"S")
 
-                print(
-                    "❌ FILE INTEGRITY VERIFICATION FAILED"
-                )
+            print("=" * 40)
+            print(f"SECURE FILE RECEIVED: {filepath}")
+            print(f"Size: {received_size} bytes")
+            print("AES-GCM authentication: SUCCESS")
+            print("SHA-256 integrity: SUCCESS")
+            print("=" * 40)
 
-                if os.path.exists(
-                    temp_filepath
-                ):
-                    os.remove(
-                        temp_filepath
-                    )
+            if on_file_received:
+                try:
+                    on_file_received(sender, filename, filepath)
+                except Exception as callback_error:
+                    print("Receive notification error:", callback_error)
 
-                conn.close()
-                continue
-
-            os.replace(
-                temp_filepath,
-                filepath
-            )
-
-            print(
-                "================================"
-            )
-
-            print(
-                "✅ SECURE FILE RECEIVED"
-            )
-
-            print(
-                f"File: {filepath}"
-            )
-
-            print(
-                f"Size: {received_size} bytes"
-            )
-
-            print(
-                "AES-GCM authentication: SUCCESS"
-            )
-
-            print(
-                "SHA-256 integrity: SUCCESS"
-            )
-
-            print(
-                "================================"
-            )
-
-            conn.close()
-
-        except Exception as e:
-
-            print(
-                "Secure file receive error:",
-                e
-            )
+        except Exception as exc:
+            print("Secure file receive error:", exc)
 
             if conn is not None:
+                try:
+                    conn.sendall(b"F")
+                except OSError:
+                    pass
 
+        finally:
+            if temp_filepath and os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
+
+            if conn is not None:
                 try:
                     conn.close()
-                except Exception:
+                except OSError:
                     pass
 
 
-def send_file(
-    file_path,
-    receiver_ip,
-    receiver_port,
-    sender_username,
-    receiver_username
-):
-    """
-    Securely send a file using the existing
-    authenticated X25519 session key.
-    """
+def send_file(file_path, receiver_ip, receiver_port,
+              sender_username, receiver_username):
+    """Send a file and wait for recipient approval and verification."""
+
+    sock = None
 
     try:
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError("Selected file does not exist")
 
-        # -----------------------------
-        # Validate file
-        # -----------------------------
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE:
+            raise ValueError("File exceeds the 1 GB size limit")
 
-        if not os.path.isfile(
-            file_path
-        ):
-
-            print(
-                "File does not exist."
-            )
-
-            return False
-
-        # -----------------------------
-        # Get existing secure session
-        # -----------------------------
-
-        session_key = get_session_key(
-            receiver_username
-        )
-
+        session_key = get_session_key(receiver_username)
         if session_key is None:
-
-            print(
-                f"No secure session exists for "
-                f"{receiver_username}"
+            raise ConnectionError(
+                f"No secure session exists for {receiver_username}"
             )
 
-            print(
-                "Establish the secure chat session first."
-            )
+        filename = os.path.basename(file_path)
+        sender_bytes = sender_username.encode("utf-8")
+        filename_bytes = filename.encode("utf-8")
 
-            return False
-
-        filename = os.path.basename(
-            file_path
-        )
-
-        filename_bytes = filename.encode(
-            "utf-8"
-        )
-
-        sender_bytes = sender_username.encode(
-            "utf-8"
-        )
-
-        if len(sender_bytes) > MAX_USERNAME_LENGTH:
-            print("Username is too long.")
-            return False
-
-        if len(filename_bytes) > MAX_FILENAME_LENGTH:
-            print("Filename is too long.")
-            return False
-
-        # -----------------------------
-        # Calculate SHA-256
-        # -----------------------------
+        if not sender_bytes or len(sender_bytes) > MAX_USERNAME_LENGTH:
+            raise ValueError("Invalid sender username length")
+        if not filename_bytes or len(filename_bytes) > MAX_FILENAME_LENGTH:
+            raise ValueError("Invalid filename length")
 
         hasher = hashlib.sha256()
-
-        file_size = 0
-
-        with open(
-            file_path,
-            "rb"
-        ) as file:
-
+        with open(file_path, "rb") as source:
             while True:
-
-                data = file.read(
-                    BUFFER_SIZE
-                )
-
-                if not data:
+                block = source.read(BUFFER_SIZE)
+                if not block:
                     break
-
-                hasher.update(
-                    data
-                )
-
-                file_size += len(
-                    data
-                )
+                hasher.update(block)
 
         sha256_hash = hasher.hexdigest()
 
-        print(
-            f"File size: {file_size} bytes"
-        )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(CONNECT_TIMEOUT)
+        sock.connect((receiver_ip, receiver_port))
+        sock.settimeout(TRANSFER_TIMEOUT)
 
-        print(
-            f"SHA-256: {sha256_hash}"
-        )
+        sock.sendall(b"LCSF1")
 
-        # -----------------------------
-        # Connect to receiver
-        # -----------------------------
+        send_uint32(sock, len(sender_bytes))
+        sock.sendall(sender_bytes)
 
-        sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
+        send_uint32(sock, len(filename_bytes))
+        sock.sendall(filename_bytes)
 
-        print(
-            f"Connecting securely to "
-            f"{receiver_ip}:{receiver_port}"
-        )
+        send_uint64(sock, file_size)
+        sock.sendall(sha256_hash.encode("ascii"))
 
-        sock.connect(
-            (
-                receiver_ip,
-                receiver_port
-            )
-        )
+        # Wait for explicit recipient approval.
+        decision = recv_exact(sock, 1)
+        if decision != b"A":
+            print("Recipient rejected the file or the request timed out.")
+            return False
 
-        # -----------------------------
-        # Protocol header
-        # -----------------------------
-
-        sock.sendall(
-            b"LCSF1"
-        )
-
-        # Sender username
-        send_uint32(
-            sock,
-            len(sender_bytes)
-        )
-
-        sock.sendall(
-            sender_bytes
-        )
-
-        # Filename
-        send_uint32(
-            sock,
-            len(filename_bytes)
-        )
-
-        sock.sendall(
-            filename_bytes
-        )
-
-        # File size
-        send_uint64(
-            sock,
-            file_size
-        )
-
-        # SHA-256
-        sock.sendall(
-            sha256_hash.encode(
-                "ascii"
-            )
-        )
-
-        # -----------------------------
-        # AES-GCM encryption
-        # -----------------------------
-
-        aes = AESGCM(
-            session_key
-        )
-
+        aes = AESGCM(session_key)
         chunk_number = 0
+        sent_size = 0
 
-        with open(
-            file_path,
-            "rb"
-        ) as file:
-
+        with open(file_path, "rb") as source:
             while True:
-
-                plaintext = file.read(
-                    BUFFER_SIZE
-                )
-
+                plaintext = source.read(BUFFER_SIZE)
                 if not plaintext:
                     break
 
-                nonce = os.urandom(
-                    NONCE_SIZE
-                )
-
+                nonce = os.urandom(NONCE_SIZE)
                 aad = build_aad(
-                    sender_username,
-                    filename,
-                    file_size,
-                    sha256_hash,
-                    chunk_number
+                    sender_username, filename, file_size,
+                    sha256_hash, chunk_number
                 )
+                encrypted_data = aes.encrypt(nonce, plaintext, aad)
 
-                encrypted_data = aes.encrypt(
-                    nonce,
-                    plaintext,
-                    aad
-                )
+                send_uint32(sock, len(encrypted_data))
+                sock.sendall(nonce)
+                sock.sendall(encrypted_data)
 
-                # Encrypted chunk length
-                send_uint32(
-                    sock,
-                    len(encrypted_data)
-                )
-
-                # Random AES-GCM nonce
-                sock.sendall(
-                    nonce
-                )
-
-                # Encrypted data + authentication tag
-                sock.sendall(
-                    encrypted_data
-                )
-
+                sent_size += len(plaintext)
                 chunk_number += 1
 
-        sock.close()
+        if sent_size != file_size:
+            raise IOError("File changed while being sent; verification required")
 
-        print(
-            "================================"
-        )
+        # Success only after receiver confirms the file was verified and saved.
+        result = recv_exact(sock, 1)
+        if result != b"S":
+            raise IOError("Receiver could not verify or save the file")
 
-        print(
-            "✅ SECURE FILE SENT"
-        )
-
-        print(
-            f"File: {filename}"
-        )
-
-        print(
-            f"Size: {file_size} bytes"
-        )
-
-        print(
-            "AES-GCM encryption: SUCCESS"
-        )
-
-        print(
-            f"SHA-256: {sha256_hash}"
-        )
-
-        print(
-            "================================"
-        )
-
+        print(f"SECURE FILE VERIFIED BY RECEIVER: {filename}")
+        print(f"Size: {file_size} bytes")
+        print(f"SHA-256: {sha256_hash}")
         return True
 
-    except Exception as e:
-
-        print(
-            "Secure file sending error:",
-            e
-        )
-
-        try:
-            sock.close()
-        except Exception:
-            pass
-
+    except Exception as exc:
+        print("Secure file sending error:", exc)
         return False
+
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
